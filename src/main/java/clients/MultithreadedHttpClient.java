@@ -1,124 +1,135 @@
 package clients;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.concurrent.*;
+import com.google.gson.Gson;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+
+import java.util.Random;
+import java.util.concurrent.*;
 
 public class MultithreadedHttpClient {
-    protected static final int TOTAL_REQUESTS = 200000;
-    protected static final int INITIAL_THREADS = 32;
-    protected static final int REQUESTS_PER_THREAD = 1000;
-    protected static final String SERVER_URL = "http://34.217.60.24:8080/JavaServlets_war/skiers";
+    private static final int TOTAL_REQUESTS = 200000;
+    private static final int INITIAL_THREADS = 32;
+    private static final int REQUESTS_PER_THREAD = 1000;
+    private static final int MAX_RETRIES = 5;
+    private static final String SERVER_URL = "http://34.219.0.248:8080/JavaServlets_war/skiers";
     
-    protected static BlockingQueue<LiftRideEvent> eventQueue = new LinkedBlockingQueue<>();
-    protected static AtomicInteger successfulRequests = new AtomicInteger(0);
-    protected static AtomicInteger failedRequests = new AtomicInteger(0);
-    protected static CountDownLatch latch = new CountDownLatch(INITIAL_THREADS);
+    private static final AtomicInteger successfulRequests = new AtomicInteger(0);
+    private static final AtomicInteger failedRequests = new AtomicInteger(0);
     
-    public static void main(String[] args) {
-        long startTime = System.currentTimeMillis();
-        System.out.println("Starting Multithreaded HTTP Client...");
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(100);
+        BlockingQueue<LiftRideEvent> queue = new LinkedBlockingQueue<>(TOTAL_REQUESTS);
         
-        // Start event producer thread
-        Thread producerThread = new Thread(() -> {
-            System.out.println("Producer thread started. Generating events...");
+        System.out.println("Starting request generation and processing...");
+        long startTime = System.currentTimeMillis();
+        
+        Thread eventGenerator = new Thread(() -> {
+            Random random = new Random();
             for (int i = 0; i < TOTAL_REQUESTS; i++) {
-                eventQueue.add(new LiftRideEvent());
-                if (i % 10000 == 0) {
-                    System.out.println("Generated " + i + " events.");
+                LiftRideEvent liftRide = new LiftRideEvent(
+                        random.nextInt(100000) + 1, // skierID
+                        random.nextInt(10) + 1,     // resortID
+                        random.nextInt(40) + 1,     // liftID
+                        2025,                       // seasonID
+                        1,                          // dayID
+                        random.nextInt(360) + 1     // time
+                );
+                try {
+                    queue.put(liftRide);
+                    if (i % 10000 == 0) {
+                        System.out.println("Generated " + i + " lift ride events...");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
-            System.out.println("Producer thread finished. Total events generated: " + TOTAL_REQUESTS);
         });
-        producerThread.start();
+        eventGenerator.start();
         
-        // Create initial threads
-        ExecutorService executor = Executors.newFixedThreadPool(INITIAL_THREADS);
-        System.out.println("Initializing " + INITIAL_THREADS + " threads...");
         for (int i = 0; i < INITIAL_THREADS; i++) {
-            executor.submit(new RequestSender(i + 1));
+            executor.submit(() -> sendRequests(queue, REQUESTS_PER_THREAD));
         }
         
-        // Wait for all threads to complete
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
+        int remainingRequests = TOTAL_REQUESTS - (INITIAL_THREADS * REQUESTS_PER_THREAD);
+        int remainingThreads = remainingRequests / REQUESTS_PER_THREAD;
+        
+        for (int i = 0; i < remainingThreads; i++) {
+            executor.submit(() -> sendRequests(queue, REQUESTS_PER_THREAD));
         }
         
+        int finalRemainingRequests = remainingRequests % REQUESTS_PER_THREAD;
+        if (finalRemainingRequests > 0) {
+            executor.submit(() -> sendRequests(queue, finalRemainingRequests));
+        }
+        
+        eventGenerator.join();
         executor.shutdown();
-        long endTime = System.currentTimeMillis();
+        executor.awaitTermination(1, TimeUnit.HOURS);
         
-        // Print results
-        System.out.println("\nAll requests completed.");
+        long endTime = System.currentTimeMillis();
+        long totalRunTime = endTime - startTime;
+        double throughput = (double) successfulRequests.get() / (totalRunTime / 1000.0);
+        
         System.out.println("Successful requests: " + successfulRequests.get());
         System.out.println("Failed requests: " + failedRequests.get());
-        System.out.println("Total runtime: " + (endTime - startTime) + " ms");
-        System.out.println("Throughput: " + (TOTAL_REQUESTS / ((endTime - startTime) / 1000.0)) + " requests/second");
+        System.out.println("Total run time: " + totalRunTime + " ms");
+        System.out.println("Total throughput: " + throughput + " requests/sec");
     }
     
-    protected static class RequestSender implements Runnable {
-        protected int threadId;
-        
-        public RequestSender(int threadId) {
-            this.threadId = threadId;
-        }
-        
-        @Override
-        public void run() {
-            System.out.println("Thread " + threadId + " started.");
-            for (int i = 0; i < REQUESTS_PER_THREAD; i++) {
-                try {
-                    LiftRideEvent event = eventQueue.take();
-                    sendPostRequest(event);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
+    private static void sendRequests(BlockingQueue<LiftRideEvent> queue, int numRequests) {
+        for (int i = 0; i < numRequests; i++) {
+            try {
+                LiftRideEvent liftRide = queue.take();
+                boolean success = attemptRequest(liftRide);
+                
+                if (success) {
+                    successfulRequests.incrementAndGet();
+                } else {
+                    failedRequests.incrementAndGet();
                 }
-            }
-            System.out.println("Thread " + threadId + " finished.");
-            latch.countDown(); // Notify that this thread has finished
-        }
-        
-        protected void sendPostRequest(LiftRideEvent event) {
-            int retries = 0;
-            while (retries < 5) {
-                try {
-                    URL url = new URL(SERVER_URL);
-                    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-                    connection.setRequestMethod("POST");
-                    connection.setRequestProperty("Content-Type", "application/json");
-                    connection.setDoOutput(true);
-                    
-                    try (OutputStream os = connection.getOutputStream()) {
-                        byte[] input = event.toJson().getBytes("utf-8");
-                        os.write(input, 0, input.length);
-                    }
-                    
-                    int responseCode = connection.getResponseCode();
-                    if (responseCode == HttpURLConnection.HTTP_CREATED) {
-                        successfulRequests.incrementAndGet();
-                        break;
-                    } else if (responseCode >= 400 && responseCode < 600) {
-                        retries++;
-                        if (retries == 5) {
-                            failedRequests.incrementAndGet();
-                            System.out.println("Thread " + threadId + ": Request failed after 5 retries.");
-                        }
-                    }
-                } catch (IOException e) {
-                    retries++;
-                    if (retries == 5) {
-                        failedRequests.incrementAndGet();
-                        System.out.println("Thread " + threadId + ": Request failed after 5 retries.");
-                    }
+                
+                if ((successfulRequests.get() + failedRequests.get()) % 10000 == 0) {
+                    System.out.println("Processed " + (successfulRequests.get() + failedRequests.get()) + " requests...");
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-            if (successfulRequests.get() % 1000 == 0) {
-                System.out.println("Total successful requests so far: " + successfulRequests.get());
+        }
+    }
+    
+    private static boolean attemptRequest(LiftRideEvent liftRide) {
+        int retries = 0;
+        while (retries < MAX_RETRIES) {
+            int statusCode = sendRequest(liftRide);
+            if (statusCode == 201) {
+                return true;
             }
+            retries++;
+        }
+        return false;
+    }
+    
+    private static int sendRequest(LiftRideEvent liftRide) {
+        try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+            HttpPost httpPost = new HttpPost(SERVER_URL);
+            httpPost.setHeader("Content-Type", "application/json");
+            
+            Gson gson = new Gson();
+            String json = gson.toJson(liftRide);
+            httpPost.setEntity(new StringEntity(json));
+            
+            try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+                return response.getCode();
+            }
+        } catch (Exception e) {
+            System.err.println("Request failed: " + e.getMessage());
+            return -1;
         }
     }
 }

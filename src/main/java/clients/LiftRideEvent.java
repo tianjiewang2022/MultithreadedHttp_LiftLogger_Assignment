@@ -8,14 +8,17 @@ public class LiftRideEvent {
     private int dayID;
     private int time;
     
-    public LiftRideEvent() {
-        this.skierID = generateRandomNumber(1, 100000);
-        this.resortID = generateRandomNumber(1, 10);
-        this.liftID = generateRandomNumber(1, 40);
-        this.seasonID = 2025;
-        this.dayID = 1;
-        this.time = generateRandomNumber(1, 360);
+    
+    
+    public LiftRideEvent(int skierID, int resortID, int liftID, int seasonID, int dayID, int time) {
+        this.skierID = skierID;
+        this.resortID = resortID;
+        this.liftID = liftID;
+        this.seasonID = seasonID;
+        this.dayID = dayID;
+        this.time = time;
     }
+    
     
     private int generateRandomNumber(int min, int max) {
         return min + (int) (Math.random() * (max - min + 1));
