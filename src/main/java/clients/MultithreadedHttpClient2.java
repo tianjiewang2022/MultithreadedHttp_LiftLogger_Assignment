@@ -1,159 +1,263 @@
 package clients;
 
-import java.io.BufferedWriter;
+import com.google.gson.Gson;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.io.OutputStream;
 
 public class MultithreadedHttpClient2 {
-    
-    /** Constant definitions for the number of threads, requests, server URL, and output file **/
-    private static final int NUM_THREADS = 100;
-    private static final int NUM_REQUESTS = 200000;
+    private static final int TOTAL_REQUESTS = 200000;
+    private static final int INITIAL_THREADS = 32;
+    private static final int REQUESTS_PER_THREAD = 1000;
+    private static final int MAX_RETRIES = 5;
     private static final String SERVER_URL = "http://34.219.0.248:8080/JavaServlets_war/skiers";
-    private static final String OUTPUT_FILE = "request_metrics.csv";
+    private static final String CSV_FILE = "request_metrics.csv";
     
-    /** Thread-safe list to store latencies and a concurrent queue to log request metrics **/
-    private static final List<Long> latencies = Collections.synchronizedList(new ArrayList<>());
-    private static final Queue<String> logQueue = new ConcurrentLinkedQueue<>();
-    private static final Random random = new Random();
+    private static final AtomicInteger successfulRequests = new AtomicInteger(0);
+    private static final AtomicInteger failedRequests = new AtomicInteger(0);
+    private static final ConcurrentLinkedQueue<RequestMetric> metrics = new ConcurrentLinkedQueue<>();
     
-    public static void main(String[] args) throws InterruptedException, IOException {
-        // Create an executor service with a fixed thread pool
-        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(100);
+        BlockingQueue<LiftRideEvent> queue = new LinkedBlockingQueue<>(TOTAL_REQUESTS);
         
-        // Create a scheduled executor service to periodically flush logs
-        ScheduledExecutorService logExecutor = Executors.newSingleThreadScheduledExecutor();
-        logExecutor.scheduleAtFixedRate(MultithreadedHttpClient2::flushLogs, 1, 1, TimeUnit.SECONDS);
+        System.out.println("Starting request generation and processing...");
+        long startTime = System.currentTimeMillis();
         
-        // Record start time to calculate the total wall time
-        long startWallTime = System.currentTimeMillis();
-        
-        // Create a list of futures to track the completion of all requests
-        List<Future<Void>> futures = new ArrayList<>();
-        
-        // Submit tasks to send requests to the server
-        for (int i = 0; i < NUM_REQUESTS; i++) {
-            futures.add(executor.submit(() -> {
-                sendPostRequest();
-                return null;
-            }));
-        }
-        
-        // Ensure all tasks complete by waiting for each future to finish
-        for (Future<Void> future : futures) {
-            try {
-                future.get();
-            } catch (ExecutionException e) {
-                e.getCause().printStackTrace();
+        Thread eventGenerator = new Thread(() -> {
+            Random random = new Random();
+            for (int i = 0; i < TOTAL_REQUESTS; i++) {
+                LiftRideEvent liftRide = new LiftRideEvent(
+                        random.nextInt(100000) + 1, // skierID
+                        random.nextInt(10) + 1,     // resortID
+                        random.nextInt(40) + 1,     // liftID
+                        2025,                       // seasonID
+                        1,                          // dayID
+                        random.nextInt(360) + 1     // time
+                );
+                try {
+                    queue.put(liftRide);
+                    if (i % 10000 == 0) {
+                        System.out.println("Generated " + i + " lift ride events...");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
+        });
+        eventGenerator.start();
+        
+        for (int i = 0; i < INITIAL_THREADS; i++) {
+            executor.submit(() -> sendRequests(queue, REQUESTS_PER_THREAD));
         }
         
-        // Shutdown executor and await termination
+        int remainingRequests = TOTAL_REQUESTS - (INITIAL_THREADS * REQUESTS_PER_THREAD);
+        int remainingThreads = remainingRequests / REQUESTS_PER_THREAD;
+        
+        for (int i = 0; i < remainingThreads; i++) {
+            executor.submit(() -> sendRequests(queue, REQUESTS_PER_THREAD));
+        }
+        
+        int finalRemainingRequests = remainingRequests % REQUESTS_PER_THREAD;
+        if (finalRemainingRequests > 0) {
+            executor.submit(() -> sendRequests(queue, finalRemainingRequests));
+        }
+        
+        eventGenerator.join();
         executor.shutdown();
-        executor.awaitTermination(10, TimeUnit.MINUTES);
-        logExecutor.shutdown();
+        executor.awaitTermination(1, TimeUnit.HOURS);
         
-        // Record end time to calculate total wall time
-        long endWallTime = System.currentTimeMillis();
-        long wallTime = endWallTime - startWallTime;
+        long endTime = System.currentTimeMillis();
+        long totalRunTime = endTime - startTime;
+        double throughput = (double) successfulRequests.get() / (totalRunTime / 1000.0);
         
-        // Compute and display the performance metrics
-        computeAndDisplayMetrics(wallTime);
+        System.out.println("Successful requests: " + successfulRequests.get());
+        System.out.println("Failed requests: " + failedRequests.get());
+        System.out.println("Total run time: " + totalRunTime + " ms");
+        System.out.println("Total throughput: " + throughput + " requests/sec");
+        
+        // Write metrics to CSV file
+        writeMetricsToCSV();
+        
+        // Calculate and display statistics
+        calculateAndDisplayStatistics();
     }
     
-    /** Send a POST request to the server and measure latency **/
-    private static void sendPostRequest() {
-        long startTime = System.currentTimeMillis();  // Record request start time
-        
-        int responseCode = -1;
-        int retries = 3;
-        
-        // Retry logic for handling failed requests
-        while (retries-- > 0) {
+    private static void sendRequests(BlockingQueue<LiftRideEvent> queue, int numRequests) {
+        for (int i = 0; i < numRequests; i++) {
             try {
-                // Create a connection to the server and configure it
-                URL url = new URL(SERVER_URL);
-                HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-                connection.setRequestMethod("POST");
-                connection.setRequestProperty("Content-Type", "application/json");
-                connection.setDoOutput(true);
+                LiftRideEvent liftRide = queue.take();
+                boolean success = attemptRequest(liftRide);
                 
-                // Generate a random lift ride event in JSON format
-                String jsonInputString = generateRandomLiftRideEvent();
-                
-                // Write the JSON data to the output stream
-                try (OutputStream os = connection.getOutputStream()) {
-                    byte[] input = jsonInputString.getBytes("utf-8");
-                    os.write(input, 0, input.length);
+                if (success) {
+                    successfulRequests.incrementAndGet();
+                } else {
+                    failedRequests.incrementAndGet();
                 }
                 
-                // Get the response code and disconnect
-                responseCode = connection.getResponseCode();
-                connection.disconnect();
-                break; // Exit retry loop if request was successful
-            } catch (IOException e) {
-                if (retries == 0) {
-                    e.printStackTrace(); // Print stack trace if all retries fail
+                if ((successfulRequests.get() + failedRequests.get()) % 10000 == 0) {
+                    System.out.println("Processed " + (successfulRequests.get() + failedRequests.get()) + " requests...");
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         }
-        
-        long endTime = System.currentTimeMillis(); // Record request end time
-        long latency = endTime - startTime;  // Calculate latency
-        latencies.add(latency); // Store latency for later processing
-        
-        // Log the request metrics (start time, request type, latency, response code)
-        logQueue.add(startTime + ",POST," + latency + "," + responseCode);
     }
     
-    /** Generate a random JSON lift ride event **/
-    private static String generateRandomLiftRideEvent() {
-        return String.format("{\"skierID\":%d,\"resortID\":%d,\"liftID\":%d,\"seasonID\":2025,\"dayID\":1,\"time\":%d}",
-                random.nextInt(100000) + 1,
-                random.nextInt(10) + 1,
-                random.nextInt(40) + 1,
-                random.nextInt(360) + 1);
-    }
-    
-    /** Periodically flush logs from the logQueue to the output file **/
-    private static void flushLogs() {
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(OUTPUT_FILE, true))) {
-            while (!logQueue.isEmpty()) {
-                writer.write(logQueue.poll() + "\n");
+    private static boolean attemptRequest(LiftRideEvent liftRide) {
+        int retries = 0;
+        while (retries < MAX_RETRIES) {
+            RequestMetric metric = sendRequest(liftRide);
+            if (metric.getResponseCode() == 201) {
+                metrics.add(metric);
+                return true;
             }
+            retries++;
+        }
+        // Add the last failed attempt metric
+        metrics.add(new RequestMetric(System.currentTimeMillis(), "POST", 0, -1));
+        return false;
+    }
+    
+    private static RequestMetric sendRequest(LiftRideEvent liftRide) {
+        long startTime = System.currentTimeMillis();
+        int statusCode = -1;
+        
+        try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+            HttpPost httpPost = new HttpPost(SERVER_URL);
+            httpPost.setHeader("Content-Type", "application/json");
+            
+            Gson gson = new Gson();
+            String json = gson.toJson(liftRide);
+            httpPost.setEntity(new StringEntity(json));
+            
+            try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+                statusCode = response.getCode();
+            }
+        } catch (Exception e) {
+            System.err.println("Request failed: " + e.getMessage());
+        }
+        
+        long endTime = System.currentTimeMillis();
+        long latency = endTime - startTime;
+        
+        return new RequestMetric(startTime, "POST", latency, statusCode);
+    }
+    
+    private static void writeMetricsToCSV() {
+        System.out.println("Writing metrics to CSV file...");
+        try (FileWriter csvWriter = new FileWriter(CSV_FILE)) {
+            // Write header
+            csvWriter.append("StartTime,RequestType,Latency,ResponseCode\n");
+            
+            // Write data
+            for (RequestMetric metric : metrics) {
+                csvWriter.append(String.valueOf(metric.getStartTime())).append(",");
+                csvWriter.append(metric.getRequestType()).append(",");
+                csvWriter.append(String.valueOf(metric.getLatency())).append(",");
+                csvWriter.append(String.valueOf(metric.getResponseCode())).append("\n");
+            }
+            
+            csvWriter.flush();
+            System.out.println("Metrics written to " + CSV_FILE);
         } catch (IOException e) {
-            e.printStackTrace(); // Print stack trace if log flushing fails
+            System.err.println("Failed to write metrics to CSV: " + e.getMessage());
         }
     }
     
-    /** Compute and display various performance metrics based on collected latencies **/
-    private static void computeAndDisplayMetrics(long wallTime) {
+    private static void calculateAndDisplayStatistics() {
+        System.out.println("Calculating statistics...");
+        
+        // Filter out failed requests for latency calculations
+        List<Long> latencies = new ArrayList<>();
+        for (RequestMetric metric : metrics) {
+            if (metric.getResponseCode() == 201) {
+                latencies.add(metric.getLatency());
+            }
+        }
+        
+        // Sort latencies for percentile calculations
+        Collections.sort(latencies);
+        
         if (latencies.isEmpty()) {
-            System.out.println("No latency data recorded.");
+            System.out.println("No successful requests to calculate statistics.");
             return;
         }
         
-        // Sort latencies for statistical analysis
-        Collections.sort(latencies);
+        // Calculate statistics
+        double mean = calculateMean(latencies);
+        double median = calculateMedian(latencies);
+        double p99 = calculatePercentile(latencies, 99);
+        long min = latencies.get(0);
+        long max = latencies.get(latencies.size() - 1);
         
-        long totalRequests = latencies.size();
-        LongSummaryStatistics stats = latencies.stream().mapToLong(Long::longValue).summaryStatistics();
-        long medianResponseTime = latencies.get(latencies.size() / 2);
-        double throughput = (double) totalRequests / (wallTime / 1000.0);
-        long p99ResponseTime = latencies.get((int) (latencies.size() * 0.99));
-        
-        // Display the computed metrics
-        System.out.println("Total Requests: " + totalRequests);
-        System.out.println("Mean Response Time: " + stats.getAverage() + " ms");
-        System.out.println("Median Response Time: " + medianResponseTime + " ms");
-        System.out.println("Throughput: " + throughput + " requests/sec");
-        System.out.println("P99 Response Time: " + p99ResponseTime + " ms");
-        System.out.println("Min Response Time: " + stats.getMin() + " ms");
-        System.out.println("Max Response Time: " + stats.getMax() + " ms");
+        // Display statistics
+        System.out.println("\nRequest Latency Statistics:");
+        System.out.println("Mean response time: " + String.format("%.2f", mean) + " ms");
+        System.out.println("Median response time: " + String.format("%.2f", median) + " ms");
+        System.out.println("p99 (99th percentile) response time: " + String.format("%.2f", p99) + " ms");
+        System.out.println("Min response time: " + min + " ms");
+        System.out.println("Max response time: " + max + " ms");
+    }
+    
+    private static double calculateMean(List<Long> values) {
+        long sum = 0;
+        for (Long value : values) {
+            sum += value;
+        }
+        return (double) sum / values.size();
+    }
+    
+    private static double calculateMedian(List<Long> values) {
+        int size = values.size();
+        if (size % 2 == 0) {
+            return (values.get(size / 2 - 1) + values.get(size / 2)) / 2.0;
+        } else {
+            return values.get(size / 2);
+        }
+    }
+    
+    private static double calculatePercentile(List<Long> values, int percentile) {
+        int index = (int) Math.ceil(percentile / 100.0 * values.size()) - 1;
+        return values.get(index);
+    }
+}
+
+class RequestMetric {
+    private final long startTime;
+    private final String requestType;
+    private final long latency;
+    private final int responseCode;
+    
+    public RequestMetric(long startTime, String requestType, long latency, int responseCode) {
+        this.startTime = startTime;
+        this.requestType = requestType;
+        this.latency = latency;
+        this.responseCode = responseCode;
+    }
+    
+    public long getStartTime() {
+        return startTime;
+    }
+    
+    public String getRequestType() {
+        return requestType;
+    }
+    
+    public long getLatency() {
+        return latency;
+    }
+    
+    public int getResponseCode() {
+        return responseCode;
     }
 }
