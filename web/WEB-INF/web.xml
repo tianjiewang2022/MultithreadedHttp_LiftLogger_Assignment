@@ -5,11 +5,24 @@
          version="4.0">
     <servlet>
         <servlet-name>SkierServlet</servlet-name>
-        <servlet-class>server.SkierServlet</servlet-class>
+        <servlet-class>assignment1.server.SkierServlet</servlet-class>
     </servlet>
 
     <servlet-mapping>
         <servlet-name>SkierServlet</servlet-name>
-        <url-pattern>/skiers/*</url-pattern>
+        <url-pattern>/skiers1/*</url-pattern>
     </servlet-mapping>
+
+    <servlet>
+        <servlet-name>SkierServlet2</servlet-name>
+        <servlet-class>assignment2.server.SkierServlet2</servlet-class>
+
+    </servlet>
+
+    <servlet-mapping>
+        <servlet-name>SkierServlet2</servlet-name>
+        <url-pattern>/skiers2/*</url-pattern>
+    </servlet-mapping>
+
+
 </web-app>
